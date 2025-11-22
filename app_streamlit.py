@@ -172,14 +172,14 @@ def make_pdf_bytes(title: str, metrics_df: pd.DataFrame, images: list[bytes], me
 
 # ---------- 侧边栏：参数 ----------
 st.sidebar.header("参数")
-uploaded = st.sidebar.file_uploader("上传 CSV（含列 't' 或 'interval'）", type=["csv"])
-use_sample = st.sidebar.checkbox("没有文件就用示例 data/ntds_sample.csv", value=True)
+uploaded = st.sidebar.file_uploader("上传 CSV（含列 't' 、 'interval'）", type=["csv"])
+use_sample = st.sidebar.checkbox("使用示例 data/ntds_sample.csv", value=True)
 
 selected_models = st.sidebar.multiselect(
     "选择模型", ["GO", "JM", "MO", "S"], default=["GO","JM","MO","S"]
 )
 train_ratio = st.sidebar.slider("训练集比例", min_value=0.5, max_value=0.95, value=0.82, step=0.01)
-run_btn = st.sidebar.button("🚀 运行")
+run_btn = st.sidebar.button("运行")
 
 # ---------- 主体：数据加载 ----------
 t = None
@@ -278,7 +278,7 @@ if run_btn:
     meta = f"数据源: {source_name} | 训练集: {len(t_train)} | 验证集: {len(t_valid)} | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     pdf_bytes = make_pdf_bytes("软件可靠性增长模型实验报告", metric_df, img_bytes_to_export, meta)
     st.download_button(
-        label="⬇️ 下载 PDF 报告",
+        label="下载 PDF 报告",
         data=pdf_bytes,
         file_name="SRGM_Report.pdf",
         mime="application/pdf",
