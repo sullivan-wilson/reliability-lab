@@ -1,10 +1,27 @@
 # viz_srgm.py
 # 专门放 SRGM 课程设计用的可视化与诊断函数
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import font_manager, rcParams
 import streamlit as st
+
+
+# ====== 全局中文字体配置（云端 + 本地统一） ======
+def setup_chinese_font():
+    # 字体文件相对路径
+    base_dir = os.path.dirname(__file__)
+    font_path = os.path.join(base_dir, "fonts", "NotoSansSC-Regular.ttf")  # 改成你实际的文件名
+
+    # 把字体注册到 matplotlib
+    font_manager.fontManager.addfont(font_path)
+    rcParams["font.family"] = "Noto Sans SC"      # 和字体内部名称保持一致
+    rcParams["axes.unicode_minus"] = False        # 解决负号显示成方块的问题
+
+# 导入模块时就执行一次
+setup_chinese_font()
 
 
 # ========== 指标表 ==========
