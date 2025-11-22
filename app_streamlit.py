@@ -203,7 +203,7 @@ if t is None:
     st.stop()
 
 N = len(t)
-st.write(f"**数据点数 N = {N}**")
+st.write(f"**数据点数 N = {N}（默认34个）**")
 split = int(max(5, min(N-1, round(N*train_ratio))))
 t_train, t_valid = t[:split], t[split:]
 st.write(f"训练集：{len(t_train)}，验证集：{len(t_valid)}（可在侧边栏调整比例）")
