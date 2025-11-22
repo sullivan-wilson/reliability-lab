@@ -1,6 +1,7 @@
 
 import numpy as np
 from scipy import stats
+from scipy.stats import kstest
 
 def mae(y, yhat):
     y, yhat = np.asarray(y), np.asarray(yhat)
@@ -21,7 +22,14 @@ def r2(y, yhat):
     return float(1 - ss_res / (ss_tot + 1e-12))
 
 def ae(y_last, yhat_last):
-    return float(abs(y_last - yhat_last))
+    """
+    绝对误差：
+    - 如果传入的是标量，返回单点绝对误差；
+    - 如果传入的是数组，返回平均绝对误差（和 MAE 一致，但名字保留 AE）。
+    """
+    y_last = np.asarray(y_last)
+    yhat_last = np.asarray(yhat_last)
+    return float(np.mean(np.abs(y_last - yhat_last)))
 
 def ks_test_residuals(y, yhat):
     y, yhat = np.asarray(y), np.asarray(yhat)
@@ -31,3 +39,16 @@ def ks_test_residuals(y, yhat):
     res_std = (res - np.mean(res)) / (np.std(res) + 1e-12)
     stat, p = stats.kstest(res_std, 'norm')
     return {"stat": float(stat), "pvalue": float(p)}
+
+def ks_on_u_values(u_values):
+    """
+    对 U 序列做 K-S 拟合优度检验：
+    原假设 H0: U ~ Uniform(0, 1)
+    返回 dict: {"stat": D统计量, "pvalue": p值}
+    """
+    u = np.asarray(u_values, dtype=float)
+    # 避免取到 0 或 1，影响数值稳定性
+    u = np.clip(u, 1e-8, 1 - 1e-8)
+
+    stat, pvalue = kstest(u, "uniform")
+    return {"stat": float(stat), "pvalue": float(pvalue)}
