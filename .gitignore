@@ -5,3 +5,10 @@ output/
 .idea/
 .vscode/
 .DS_Store
+# 默认忽略 data 下所有 csv（新生成的数据集）
+data/*.csv
+
+# 但保留课程用的几个固定数据集
+!data/ntds_sample.csv
+!data/ntds_from_slide.csv
+
