@@ -35,7 +35,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False  # 解决负号显示为方块
 
 # ---------- 页面基础 ----------
 st.set_page_config(page_title="软件可靠性增长模型平台", layout="wide")
-st.title("软件可靠性增长模型（SRGM）小平台")
+st.title("软件可靠性增长模型")
 st.caption("上传 CSV → 勾选模型 → 一键运行 → 指标 & 曲线 → 导出 PDF 报告")
 
 
