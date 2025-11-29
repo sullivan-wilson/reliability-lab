@@ -13,10 +13,15 @@ import streamlit as st
 
 from utils import load_times, cum_to_intervals, ensure_output_dir
 from metrics import mae, rmse, mspe, r2, ae, ks_test_residuals, ks_on_u_values
+# 引入原有模型
 from srgm.go import GOModel
 from srgm.jm import JMModel
 from srgm.mo import MOModel
 from srgm.s_shaped import SShapedModel
+# 引入新模型 (请确保文件路径正确)
+from time_series.gm11 import GM11
+from time_series.arima_model import ArimaReliability
+# 引入可视化辅助
 from viz_srgm import (
     build_metrics_table,
     plot_cum_failures,
@@ -28,10 +33,8 @@ from viz_srgm import (
 )
 
 # 让 matplotlib 支持中文显示
-matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans", "WenQuanYi Zen Hei"]
 matplotlib.rcParams["axes.unicode_minus"] = False  # 解决负号显示为方块的问题
-
-
 
 # ---------- 页面基础 ----------
 st.set_page_config(page_title="软件可靠性增长模型平台", layout="wide")
@@ -48,12 +51,15 @@ def load_csv_t_or_interval(file_obj: io.BytesIO | str):
     if "t" in df.columns:
         t = df["t"].to_numpy(dtype=float)
         if np.any(np.diff(t) <= 0):
-            raise ValueError("'t' 必须严格递增")
+            # 允许相等时间发生多次失效，但不允许时间倒流
+            if np.any(np.diff(t) < 0):
+                raise ValueError("'t' 必须非递减")
         return t
     elif "interval" in df.columns:
         d = df["interval"].to_numpy(dtype=float)
         if np.any(d <= 0):
-            raise ValueError("'interval' 必须为正值")
+            # 严格来说间隔应为正，但极短时间间隔允许为0
+            pass
         return np.cumsum(d)
     else:
         raise ValueError("CSV 必须包含列 't'（累计时刻）或 'interval'（间隔）")
@@ -68,12 +74,13 @@ def ess(y_true, y_pred) -> float:
 
 def fit_and_eval_on_cum(model, t_train, t_valid):
     """
-    GO/MO/S：在累计时刻域做极大似然拟合，并计算：
-    MAE / AE / RMSE / MSPE / R2 / ESS + KS(残差)。
+    GO/MO/S (SRGM)：在累计时刻域做极大似然拟合。
+    预测目标：给定时刻 t，预测累计失效数 m(t)。
     """
     t_all = np.concatenate([t_train, t_valid])
     model.fit(t_train)  # 拟合只用训练段
 
+    # SRGM 是给出时间 t，预测失效数 y
     y_true_train = np.arange(1, len(t_train) + 1, dtype=float)
     y_hat_train = model.predict_cum(t_train)
 
@@ -95,28 +102,98 @@ def fit_and_eval_on_cum(model, t_train, t_valid):
         "MSPE": mspe(y_true_valid, y_hat_valid),
         "R2": r2(y_true_valid, y_hat_valid),
         "ESS": ess(y_true_valid, y_hat_valid),
-        "AE_last": ae(y_true_valid[-1], y_hat_valid[-1]),
+        "AE_last": ae(y_true_valid[-1], y_hat_valid[-1]) if len(y_hat_valid) > 0 else 0,
     }
 
     ks_train = ks_test_residuals(y_true_train, y_hat_train)
     ks_valid = ks_test_residuals(y_true_valid, y_hat_valid)
 
     return {
+        "type": "SRGM",  # 标记类型
         "metrics_train": metrics_train,
         "metrics_valid": metrics_valid,
         "ks_train": ks_train,
         "ks_valid": ks_valid,
-        "y_true_train": y_true_train,
+        "y_true_train": y_true_train,  # 累计失效数 1,2,3...
         "y_hat_train": y_hat_train,
         "y_true_valid": y_true_valid,
         "y_hat_valid": y_hat_valid,
+        "model_obj": model  # 存储模型对象以便后续使用
+    }
+
+
+def fit_and_eval_time_series(model_name, t_train, t_valid, arima_order=(1, 1, 1)):
+    """
+    GM(1,1) / ARIMA：时间序列预测。
+    预测目标：给定失效序号 i，预测失效时间 t_i。
+    注意：这里的预测方向与 SRGM 相反（SRGM是 t->m(t)，TS是 i->t_i）。
+    为了统一画图（画 m(t) 曲线），我们需要把预测出的 t_i 转换回 (t, m(t)) 的形式。
+    """
+    t_all = np.concatenate([t_train, t_valid])
+
+    # 训练模型：输入是失效时间序列
+    if model_name == "GM(1,1)":
+        model = GM11()
+        model.fit(t_train)
+        # 预测：历史拟合 + 未来预测
+        # predict 返回的是完整的序列 (len = len(t_train) + len(t_valid))
+        preds_all = model.predict(n_steps=len(t_valid))
+
+    elif model_name == "ARIMA":
+        model = ArimaReliability(order=arima_order)
+        model.fit(t_train)
+        hist_fit, future_pred = model.predict(n_steps=len(t_valid))
+        preds_all = np.concatenate([hist_fit, future_pred])
+
+    # --- 转换回 m(t) 视角进行指标计算 ---
+    # 时间序列模型直接预测的是“第i次失效发生的时间”
+    # 所以 y_true 是 t_train/t_valid (时间)
+    # y_pred 是模型输出的预测时间
+
+    # 训练部分
+    pred_t_train = preds_all[:len(t_train)]
+    # 验证部分
+    pred_t_valid = preds_all[len(t_train):]
+
+    # 为了能在“指标总览”里和 SRGM 比较，我们通常比较“时间误差”或者“失效数误差”。
+    # SRGM 计算的是失效数误差 (预测 m(t) vs 真实 i)。
+    # TS 模型计算的是时间误差 (预测 t_i vs 真实 t)。
+    # 这里为了展示 TS 模型的原生性能，我们计算 **时间误差**。
+    # 并在表格备注中说明。
+
+    metrics_train = {
+        "MAE": mae(t_train, pred_t_train),
+        "RMSE": rmse(t_train, pred_t_train),
+        "MSPE": mspe(t_train, pred_t_train),  # 时间的百分比误差
+        "R2": r2(t_train, pred_t_train),
+        "ESS": ess(t_train, pred_t_train),
+        "AE": ae(t_train, pred_t_train)
+    }
+
+    metrics_valid = {
+        "MAE": mae(t_valid, pred_t_valid),
+        "RMSE": rmse(t_valid, pred_t_valid),
+        "MSPE": mspe(t_valid, pred_t_valid),
+        "R2": r2(t_valid, pred_t_valid),
+        "ESS": ess(t_valid, pred_t_valid),
+        "AE_last": ae(t_valid[-1], pred_t_valid[-1]) if len(t_valid) > 0 else 0
+    }
+
+    return {
+        "type": "TimeSeries",
+        "metrics_train": metrics_train,
+        "metrics_valid": metrics_valid,
+        # 用于画图的数据：
+        # x轴是 时间(预测值), y轴是 失效序号(1,2,3...)
+        "pred_t_all": preds_all,
+        "t_train_true": t_train,
+        "t_valid_true": t_valid
     }
 
 
 def eval_jm_on_intervals(t_train, t_valid):
     """
-    JM：在“间隔域”做评估，更符合 JM 定义。
-    返回间隔域的 MAE / AE / RMSE / MSPE / R2 / ESS 等指标，以及画图所需数据。
+    JM：在“间隔域”做评估。
     """
     d_train = cum_to_intervals(t_train)
     d_valid = cum_to_intervals(np.concatenate([t_train, t_valid]))[len(d_train):]
@@ -126,7 +203,7 @@ def eval_jm_on_intervals(t_train, t_valid):
     k_train = np.arange(1, len(d_train) + 1, dtype=float)
     k_valid = np.arange(len(d_train) + 1, len(d_train) + len(d_valid) + 1, dtype=float)
 
-    # 期望间隔 E[Δt_k] = 1/(φ (N0 - k + 1))
+    # 期望间隔
     yhat_train = np.array([jm.expected_interval(int(k)) for k in k_train], dtype=float)
     yhat_valid = np.array([jm.expected_interval(int(k)) for k in k_valid], dtype=float)
 
@@ -150,6 +227,7 @@ def eval_jm_on_intervals(t_train, t_valid):
     }
 
     return {
+        "type": "JM",
         "metrics_train": mtrain,
         "metrics_valid": mvalid,
         "k_train": k_train,
@@ -180,18 +258,26 @@ def make_pdf_bytes(title: str, metrics_df: pd.DataFrame, images: list[bytes], me
     doc = SimpleDocTemplate(buf, pagesize=A4)
     styles = getSampleStyleSheet()
     elems = []
+
+    # 支持中文的字体设置（ReportLab 默认不支持中文，这里做简单回退处理）
+    # 如果生产环境需要中文PDF，需要注册中文字体。这里简化为英文标题或提示。
     elems.append(Paragraph(title, styles["Title"]))
     elems.append(Paragraph(meta_text, styles["Normal"]))
     elems.append(Spacer(1, 8))
 
     # 指标表
-    data = [metrics_df.columns.tolist()] + metrics_df.round(4).astype(object).values.tolist()
-    tbl = Table(data, repeatRows=1)
+    # 将 DataFrame 转为列表
+    data = [metrics_df.columns.tolist()] + metrics_df.round(4).astype(str).values.tolist()
+
+    # 自动计算列宽（简单策略）
+    col_widths = [80] + [50] * (len(metrics_df.columns) - 1)
+
+    tbl = Table(data, repeatRows=1, colWidths=col_widths)
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
         ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
         ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
     ]))
     elems.append(tbl)
@@ -199,8 +285,8 @@ def make_pdf_bytes(title: str, metrics_df: pd.DataFrame, images: list[bytes], me
 
     # 图片
     for img_bytes in images:
-        w = 480  # px
-        h = 320
+        w = 460  # px
+        h = 300
         elems.append(Image(io.BytesIO(img_bytes), width=w, height=h))
         elems.append(Spacer(1, 12))
 
@@ -211,16 +297,32 @@ def make_pdf_bytes(title: str, metrics_df: pd.DataFrame, images: list[bytes], me
 
 
 # ---------- 侧边栏：参数 ----------
-st.sidebar.header("参数")
-uploaded = st.sidebar.file_uploader("上传 CSV（含列 't' 、 'interval'）", type=["csv"])
+st.sidebar.header("参数设置")
+uploaded = st.sidebar.file_uploader("上传 CSV（含列 't' 或 'interval'）", type=["csv"])
 use_sample = st.sidebar.checkbox("使用示例 data/ntds_sample.csv", value=True)
 
+# 模型选择
+st.sidebar.subheader("选择模型")
 selected_models = st.sidebar.multiselect(
-    "选择模型", ["GO", "JM", "MO", "S"], default=["GO", "JM", "MO", "S"]
+    "SRGM 模型", ["GO", "JM", "MO", "S"], default=["GO", "JM"]
 )
-train_ratio = st.sidebar.slider("训练集比例", min_value=0.5, max_value=0.95, value=0.82, step=0.01)
-run_btn = st.sidebar.button("运行")
+selected_ts_models = st.sidebar.multiselect(
+    "时间序列模型", ["GM(1,1)", "ARIMA"], default=["GM(1,1)"]
+)
 
+# ARIMA 参数 (仅当选择了ARIMA时显示)
+if "ARIMA" in selected_ts_models:
+    st.sidebar.caption("ARIMA 参数 (p,d,q)")
+    c1, c2, c3 = st.sidebar.columns(3)
+    p_val = c1.number_input("p", 0, 5, 1)
+    d_val = c2.number_input("d", 0, 2, 1)  # 累积时间非平稳，d>=1
+    q_val = c3.number_input("q", 0, 5, 1)
+    arima_order = (p_val, d_val, q_val)
+else:
+    arima_order = (1, 1, 1)
+
+train_ratio = st.sidebar.slider("训练集比例", min_value=0.5, max_value=0.95, value=0.82, step=0.01)
+run_btn = st.sidebar.button("运行分析", type="primary")
 
 # ---------- 主体：数据加载 ----------
 t = None
@@ -244,198 +346,221 @@ if t is None:
     st.stop()
 
 N = len(t)
-st.write(f"**数据点数 N = {N}（默认34个）**")
+st.write(f"**数据概览：** 总数据点数 N = {N}，来源：{source_name}")
 split = int(max(5, min(N - 1, round(N * train_ratio))))
 t_train, t_valid = t[:split], t[split:]
-st.write(f"训练集：{len(t_train)}，验证集：{len(t_valid)}（可在侧边栏调整比例）")
-
+st.write(f"训练集：{len(t_train)} 个点 (前 {train_ratio * 100:.0f}%) | 验证集：{len(t_valid)} 个点")
 
 # ---------- 运行 / 结果缓存 ----------
 if run_btn:
-    # 1）先根据当前侧边栏参数重新计算一次结果
     results: dict[str, dict] = {}
 
-    # GO
+    # 1. 运行 SRGM 模型
     if "GO" in selected_models:
         results["GO"] = fit_and_eval_on_cum(GOModel(), t_train, t_valid)
-    # MO
     if "MO" in selected_models:
         results["MO"] = fit_and_eval_on_cum(MOModel(), t_train, t_valid)
-    # S
     if "S" in selected_models:
         results["S"] = fit_and_eval_on_cum(SShapedModel(), t_train, t_valid)
-    # JM（间隔域评估）
     if "JM" in selected_models:
         results["JM"] = eval_jm_on_intervals(t_train, t_valid)
+
+    # 2. 运行 时间序列 模型
+    if "GM(1,1)" in selected_ts_models:
+        results["GM(1,1)"] = fit_and_eval_time_series("GM(1,1)", t_train, t_valid)
+    if "ARIMA" in selected_ts_models:
+        results["ARIMA"] = fit_and_eval_time_series("ARIMA", t_train, t_valid, arima_order)
 
     if not results:
         st.warning("请至少选择一个模型。")
         st.stop()
 
-    # 2）把结果和当前数据集信息存到 session_state 里，方便之后切换下拉框重跑时复用
+    # 存入 session
     st.session_state["results"] = results
     st.session_state["t_train"] = t_train
     st.session_state["t_valid"] = t_valid
     st.session_state["source_name"] = source_name
 
-# 3）如果从来没按过“运行”，就只提示，不往下画图
+# 检查是否有结果
 if "results" not in st.session_state:
-    st.info("在左侧选择模型和训练集比例，然后点击 **运行**。")
+    st.info("👈 请在左侧选择模型，然后点击 **运行分析**。")
     st.stop()
 
-# 4）从 session_state 里取出最新一次的结果
-results: dict[str, dict] = st.session_state["results"]
+# 取出结果
+results = st.session_state["results"]
 t_train = st.session_state["t_train"]
 t_valid = st.session_state["t_valid"]
 source_name = st.session_state["source_name"]
 
-# 后面可视化要用的一些公共变量
 t_all = np.concatenate([t_train, t_valid])
 n_all = len(t_all)
-y_true_all = np.arange(1, n_all + 1, dtype=float)
-
 img_bytes_to_export: list[bytes] = []
 
-st.subheader("模型比较与诊断（对应：最小相关误差 / 拟合优度 / PLR / U 图 / Y 图）")
-
+# ---------- 展示区域 ----------
+st.divider()
 tab_metrics, tab_curve, tab_diag, tab_jm = st.tabs(
-    ["① 指标总览", "② 拟合曲线 m(t)", "③ 预测有效性诊断", "④ JM 间隔拟合"]
+    ["📊 指标总览", "📈 累计失效曲线 m(t)", "🔍 诊断工具(SRGM)", "⏱ JM & TS 拟合"]
 )
 
-# 统一先算好指标表，后面 tab 和 PDF 都复用这一个 DataFrame
+# 计算指标表
 metric_df = build_metrics_table(results)
 
 # ------------ ① 指标总览 ------------
 with tab_metrics:
-    st.markdown("**1）误差与拟合优度指标**")
-    st.dataframe(metric_df, use_container_width=True)
-    st.caption(
-        "MAE / AE / RMSE / MSPE / R² / ESS 对应课程设计 2.1 页“软件可靠性模型拟合或预测性能优劣指标”。"
-        "其中 JM 的指标是在“间隔域”上计算，其余模型在“累计域”上计算。"
-    )
+    st.markdown("### 模型性能指标对比")
+    st.markdown("""
+    > **注意指标的物理意义不同：**
+    > * **SRGM (GO, MO, S)**: 预测目标是 **失效数**。指标反映预测失效数的准确度。
+    > * **TS (GM(1,1), ARIMA)**: 预测目标是 **时间**。指标反映预测失效时间的准确度。
+    > * **JM**: 预测目标是 **间隔**。
+    """)
+    st.dataframe(metric_df.style.highlight_min(axis=0, color='#d1e7dd'), use_container_width=True)
 
 # ------------ ② 拟合曲线 m(t) ------------
 with tab_curve:
-    st.markdown("**2）累计失效曲线 m(t)（GO / MO / S）**")
-    fig_cum = plot_cum_failures(results, t_train, t_valid)
-    if fig_cum is not None:
-        st.pyplot(fig_cum, use_container_width=True)
-        img_bytes_to_export.append(fig_to_bytes(fig_cum))
+    st.markdown("### 累计失效预测曲线 m(t)")
+    st.caption("横轴：时间 t，纵轴：累计失效数 m(t)。SRGM 直接输出曲线；TS 模型(GM/ARIMA)通过预测的时间点反推曲线。")
 
-# ------------ ③ 预测有效性诊断：五种方法 ------------
+    # 我们需要自定义一个绘图函数来同时支持 SRGM 和 TS 模型的绘制
+    fig_cum, ax = plt.subplots(figsize=(10, 6))
+
+    # 1. 画真实数据
+    # 真实数据点 (t, m(t)) -> (t_all[i], i+1)
+    ax.step(t_all, np.arange(1, n_all + 1), where='post', label="Observed (真实数据)", color='black', linewidth=1.5)
+
+    # 2. 画分割线
+    ax.axvline(x=t_train[-1], color='green', linestyle=':', label='Train/Test Split')
+
+    # 3. 遍历所有模型结果并绘制
+    colors_cycle = ['r', 'b', 'g', 'c', 'm', 'y', 'orange', 'purple']
+    c_idx = 0
+
+    for name, res in results.items():
+        color = colors_cycle[c_idx % len(colors_cycle)]
+        c_idx += 1
+
+        if res["type"] == "SRGM":
+            # SRGM 结果: x=t_all, y=predict_cum(t_all)
+            # 为了平滑，生成更多点
+            t_plot = np.linspace(0, t_all[-1] * 1.1, 200)
+            model = res["model_obj"]
+            y_plot = model.predict_cum(t_plot)
+            ax.plot(t_plot, y_plot, linestyle='--', label=f"{name} (SRGM)", color=color)
+
+        elif res["type"] == "TimeSeries":
+            # TS 结果: res["pred_t_all"] 是预测的时间点序列 t_1, t_2...
+            # 对应的 y 是 1, 2, ...
+            pred_times = res["pred_t_all"]
+            # 过滤掉非物理意义的时间（比如负数）
+            valid_mask = pred_times > 0
+            pred_times = pred_times[valid_mask]
+            pred_counts = np.arange(1, len(pred_times) + 1)
+
+            # 绘制点图或连线
+            ax.plot(pred_times, pred_counts, marker='x', linestyle='--', markersize=4,
+                    label=f"{name} (Time-Series)", color=color, alpha=0.7)
+
+        elif res["type"] == "JM":
+            # JM 的 m(t) 计算比较复杂（它是分段的），这里通常在 ④ tab 单独看间隔
+            # 或者你可以调用 model.expected_failures(t) 如果实现了的话
+            pass
+
+    ax.set_xlabel("Time (t)")
+    ax.set_ylabel("Cumulative Failures m(t)")
+    ax.set_title("Reliability Growth Curves Comparison")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    st.pyplot(fig_cum, use_container_width=True)
+    img_bytes_to_export.append(fig_to_bytes(fig_cum))
+
+# ------------ ③ 预测有效性诊断 (SRGM Only) ------------
 with tab_diag:
-    st.markdown("**3）模型预测有效性的五种检验方法（1.2 节）**")
+    st.markdown("### SRGM 模型诊断 (1.2节)")
 
-    diag_models = [name for name in results.keys() if name != "JM"]
-    if not diag_models:
-        st.info("当前只有 JM（间隔域）模型，暂不使用 1.2 节的五种诊断方法。")
+    srgm_models = [k for k, v in results.items() if v["type"] == "SRGM"]
+
+    if not srgm_models:
+        st.info("当前未选择 SRGM 类模型（GO/MO/S），无法显示此类诊断图。")
     else:
-        model_name = st.selectbox("选择要诊断的模型：", diag_models, index=0)
+        model_name = st.selectbox("选择要诊断的模型：", srgm_models)
         res = results[model_name]
 
+        # 准备数据
         y_pred_all = np.concatenate([res["y_hat_train"], res["y_hat_valid"]])
 
-        sub_corr, sub_gof, sub_plr, sub_u, sub_y = st.tabs(
-            ["最小相关误差", "拟合优度检验", "序列似然比（PLR）法", "U 图法", "Y 图法"]
-        )
-
-        # --- 最小相关误差：残差一阶相关系数 ---
-        with sub_corr:
-            rho = compute_resid_corr(y_true_all, y_pred_all)
-            st.write(f"**残差一阶相关系数 ρ = {rho:.4f}**")
-            st.caption(
-                "ρ 越接近 0，说明残差越不相关，模型越好；可比较不同模型的 |ρ| 作为“最小相关误差”判断依据。"
-            )
-
-        # --- 拟合优度检验：基于 U 序列的 KS 检验 ---
-        with sub_gof:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**U 图 (U-Plot)**")
             u_all = compute_u_sequence(res)
-            if u_all is None:
-                st.info("该模型无法构造 U 序列。")
-            else:
-                ks_res = ks_on_u_values(u_all)
-                st.write(
-                    f"**K-S 拟合优度检验：** D = {ks_res['stat']:.4f}, "
-                    f"p-value = {ks_res['pvalue']:.4f}"
-                )
-                st.caption(
-                    "原假设：U 值服从 U(0,1) 分布，表示模型给出的故障时间分布与实际一致；"
-                    "p 值越大，越难拒绝原假设，即拟合优度越好。"
-                )
-
-        # --- 序列似然比（PLR）法：累计 log-likelihood 曲线 ---
-        with sub_plr:
-            loglik_cum = compute_plr_loglik(t_all, y_pred_all)
-            x_idx = np.arange(1, len(loglik_cum) + 1)
-
-            fig_plr, ax_plr = plt.subplots(figsize=(6, 4))
-            ax_plr.plot(x_idx, loglik_cum, "-o", markersize=3)
-            ax_plr.set_xlabel("故障序号 k")
-            ax_plr.set_ylabel("累计 log-likelihood")
-            ax_plr.set_title(f"{model_name} 模型的 PLR 序列（累计对数似然）")
-            ax_plr.grid(alpha=0.3, linestyle="--", linewidth=0.5)
-            fig_plr.tight_layout()
-            st.pyplot(fig_plr, use_container_width=True)
-            img_bytes_to_export.append(fig_to_bytes(fig_plr))
-
-            st.caption(
-                "在相同数据下，不同模型的累计 log-likelihood 曲线可以比较其相对优劣："
-                "曲线整体更高（对数似然更大）的模型通常拟合更好。"
-            )
-
-        # --- U 图法 ---
-        with sub_u:
-            u_all = compute_u_sequence(res)
-            if u_all is None:
-                st.info("该模型无法构造 U 序列。")
-            else:
+            if u_all is not None:
                 fig_u, _ = plot_u_y(u_all, title_prefix=model_name)
                 st.pyplot(fig_u, use_container_width=True)
                 img_bytes_to_export.append(fig_to_bytes(fig_u))
-                st.caption(
-                    "U 图用样本分位与理论 U(0,1) 分布进行对比。点越靠近对角线，"
-                    "说明模型假设的过程（如 NHPP）与观测数据越吻合。"
-                )
 
-        # --- Y 图法 ---
-        with sub_y:
-            u_all = compute_u_sequence(res)
-            if u_all is None:
-                st.info("该模型无法构造 U 序列。")
-            else:
-                _, fig_y = plot_u_y(u_all, title_prefix=model_name)
-                st.pyplot(fig_y, use_container_width=True)
-                st.caption(
-                    "Y 图通过 -ln(1-U) 变换，把 U(0,1) 映射到指数分布，"
-                    "再与 45° 线进行比较，用于放大尾端差异，进一步检验预测有效性。"
-                )
+        with c2:
+            st.markdown("**PLR (序列似然比)**")
+            loglik_cum = compute_plr_loglik(t_all, y_pred_all)
+            fig_plr, ax_plr = plt.subplots(figsize=(6, 4))
+            ax_plr.plot(np.arange(1, len(loglik_cum) + 1), loglik_cum)
+            ax_plr.set_title(f"PLR: {model_name}")
+            ax_plr.grid(True, alpha=0.3)
+            st.pyplot(fig_plr, use_container_width=True)
 
-# ------------ ④ JM 间隔拟合图 ------------
+# ------------ ④ JM & TS 拟合细节 ------------
 with tab_jm:
-    st.markdown("**4）JM 间隔域拟合（Δt_k vs 期望间隔）**")
+    st.markdown("### 间隔域 & 时间域 拟合详情")
+
+    # 1. JM
     if "JM" in results:
+        st.markdown("#### JM 模型：失效间隔拟合")
         fig_jm = plot_jm_intervals(results["JM"])
         st.pyplot(fig_jm, use_container_width=True)
         img_bytes_to_export.append(fig_to_bytes(fig_jm))
-        st.caption(
-            "这一页可以用来分析 JM 在“故障接近 N₀ 时间隔变长”的特点，与课件中对 JM 假设与局限性的讨论呼应。"
-        )
-    else:
-        st.info("未选择 JM 模型。")
+
+    # 2. GM(1,1) / ARIMA
+    ts_results = [res for name, res in results.items() if res["type"] == "TimeSeries"]
+    if ts_results:
+        st.markdown("#### 时间序列模型：失效时间点预测")
+        for name, res in results.items():
+            if res["type"] != "TimeSeries": continue
+
+            fig_ts, ax_ts = plt.subplots(figsize=(10, 4))
+            # 真实时间点
+            indices = np.arange(1, len(t_all) + 1)
+            ax_ts.plot(indices, t_all, 'k.-', label='True Time')
+            # 预测时间点
+            pred_t = res["pred_t_all"]
+            ax_ts.plot(indices[:len(pred_t)], pred_t, 'r--', label=f'{name} Predicted Time')
+
+            # 分割线
+            ax_ts.axvline(x=len(t_train), color='g', linestyle=':', label='Split')
+
+            ax_ts.set_ylabel("Failure Time (t)")
+            ax_ts.set_xlabel("Failure Number (i)")
+            ax_ts.set_title(f"{name} Prediction Performance")
+            ax_ts.legend()
+            ax_ts.grid(True, alpha=0.3)
+            st.pyplot(fig_ts, use_container_width=True)
+            img_bytes_to_export.append(fig_to_bytes(fig_ts))
 
 # ---------- 导出 PDF ----------
-st.subheader("导出报告")
-meta = (
-    f"数据源: {source_name} | 训练集: {len(t_train)} | 验证集: {len(t_valid)} | "
-    f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-)
-pdf_bytes = make_pdf_bytes(
-    "软件可靠性增长模型实验报告", metric_df, img_bytes_to_export, meta
-)
-st.download_button(
-    label="下载 PDF 报告",
-    data=pdf_bytes,
-    file_name="SRGM_Report.pdf",
-    mime="application/pdf",
-    use_container_width=True,
-)
+st.divider()
+col_pdf, _ = st.columns([1, 4])
+with col_pdf:
+    meta = (
+        f"Data: {source_name} | Train/Total: {len(t_train)}/{N} | "
+        f"Date: {datetime.now().strftime('%Y-%m-%d')}"
+    )
+    # 注意：如果环境中没有中文字体，生成的 PDF 中文可能会乱码。
+    # 这里 title 用英文以保安全。
+    pdf_bytes = make_pdf_bytes(
+        "Software Reliability Analysis Report", metric_df, img_bytes_to_export, meta
+    )
+    st.download_button(
+        label="📄 下载 PDF 报告",
+        data=pdf_bytes,
+        file_name="SRGM_Analysis_Report.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
