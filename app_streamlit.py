@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+
 import streamlit as st
 
 from utils import load_times, cum_to_intervals, ensure_output_dir
@@ -21,6 +22,9 @@ from srgm.s_shaped import SShapedModel
 # 引入新模型 (请确保文件路径正确)
 from time_series.gm11 import GM11
 from time_series.arima_model import ArimaReliability
+
+from ml_models.svr_model import SVRReliability
+from ml_models.bpnn_model import BPNNReliability
 # 引入可视化辅助
 from viz_srgm import (
     build_metrics_table,
@@ -122,7 +126,7 @@ def fit_and_eval_on_cum(model, t_train, t_valid):
     }
 
 
-def fit_and_eval_time_series(model_name, t_train, t_valid, arima_order=(1, 1, 1)):
+def fit_and_eval_time_series(model_name, t_train, t_valid, arima_order=(1, 1, 1), params=None):
     """
     GM(1,1) / ARIMA：时间序列预测。
     预测目标：给定失效序号 i，预测失效时间 t_i。
@@ -130,7 +134,9 @@ def fit_and_eval_time_series(model_name, t_train, t_valid, arima_order=(1, 1, 1)
     为了统一画图（画 m(t) 曲线），我们需要把预测出的 t_i 转换回 (t, m(t)) 的形式。
     """
     t_all = np.concatenate([t_train, t_valid])
-
+    # 确保 params 是字典，防止 NoneType 错误
+    if params is None:
+        params = {}
     # 训练模型：输入是失效时间序列
     if model_name == "GM(1,1)":
         model = GM11()
@@ -141,6 +147,26 @@ def fit_and_eval_time_series(model_name, t_train, t_valid, arima_order=(1, 1, 1)
 
     elif model_name == "ARIMA":
         model = ArimaReliability(order=arima_order)
+        model.fit(t_train)
+        hist_fit, future_pred = model.predict(n_steps=len(t_valid))
+        preds_all = np.concatenate([hist_fit, future_pred])
+    # --- 新增代码 (SVR & BP) ---
+    elif model_name == "SVR":
+        # params 结构: {'window': 3, 'C': 100, 'gamma': 0.1}
+        w = params.get('window', 3)
+        c = params.get('C', 100)
+        g = params.get('gamma', 0.1)
+        model = SVRReliability(window_size=w, C=c, gamma=g)
+        model.fit(t_train)
+        hist_fit, future_pred = model.predict(n_steps=len(t_valid))
+        preds_all = np.concatenate([hist_fit, future_pred])
+
+    elif model_name == "BPNN":
+        # params 结构: {'window': 3, 'hidden': (100,), 'iter': 2000}
+        w = params.get('window', 3)
+        h = params.get('hidden', (100,))
+        itr = params.get('iter', 2000)
+        model = BPNNReliability(window_size=w, hidden_layer_sizes=h, max_iter=itr)
         model.fit(t_train)
         hist_fit, future_pred = model.predict(n_steps=len(t_valid))
         preds_all = np.concatenate([hist_fit, future_pred])
@@ -307,7 +333,7 @@ selected_models = st.sidebar.multiselect(
     "SRGM 模型", ["GO", "JM", "MO", "S"], default=["GO", "JM"]
 )
 selected_ts_models = st.sidebar.multiselect(
-    "时间序列模型", ["GM(1,1)", "ARIMA"], default=["GM(1,1)"]
+    "时间序列/智能模型", ["GM(1,1)", "ARIMA", "SVR", "BPNN"], default=["GM(1,1)"]
 )
 
 # ARIMA 参数 (仅当选择了ARIMA时显示)
@@ -320,6 +346,25 @@ if "ARIMA" in selected_ts_models:
     arima_order = (p_val, d_val, q_val)
 else:
     arima_order = (1, 1, 1)
+
+# SVR 参数 (新增)
+svr_params = {}
+if "SVR" in selected_ts_models:
+    with st.sidebar.expander("SVR 参数 (智能算法)"):
+        svr_win = st.slider("滑动窗口 (Look-back)", 2, 10, 3, key="svr_w")
+        svr_c = st.number_input("C (正则化)", 1.0, 1000.0, 100.0, step=10.0, key="svr_c")
+        svr_g = st.number_input("Gamma", 0.001, 1.0, 0.1, step=0.01, key="svr_g")
+        svr_params = {'window': svr_win, 'C': svr_c, 'gamma': svr_g}
+
+# BPNN 参数 (新增)
+bp_params = {}
+if "BPNN" in selected_ts_models:
+    with st.sidebar.expander("BP 神经网络参数"):
+        bp_win = st.slider("滑动窗口", 2, 10, 3, key="bp_w")
+        bp_node = st.number_input("隐藏层节点数", 10, 500, 100, step=10, key="bp_n")
+        bp_iter = st.number_input("最大迭代次数", 500, 5000, 2000, step=100, key="bp_i")
+        bp_params = {'window': bp_win, 'hidden': (bp_node,), 'iter': bp_iter}
+
 
 train_ratio = st.sidebar.slider("训练集比例", min_value=0.5, max_value=0.95, value=0.82, step=0.01)
 run_btn = st.sidebar.button("运行分析", type="primary")
@@ -364,6 +409,11 @@ if run_btn:
         results["S"] = fit_and_eval_on_cum(SShapedModel(), t_train, t_valid)
     if "JM" in selected_models:
         results["JM"] = eval_jm_on_intervals(t_train, t_valid)
+    if "SVR" in selected_ts_models:
+        results["SVR"] = fit_and_eval_time_series("SVR", t_train, t_valid, params=svr_params)
+
+    if "BPNN" in selected_ts_models:
+        results["BPNN"] = fit_and_eval_time_series("BPNN", t_train, t_valid, params=bp_params)
 
     # 2. 运行 时间序列 模型
     if "GM(1,1)" in selected_ts_models:
